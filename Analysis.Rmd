@@ -1,0 +1,145 @@
+---
+---
+---
+
+```{r setup, include=FALSE}
+# Load Required Libraries
+library(dplyr)
+library(forecast)
+library(ggplot2)
+library(lubridate)
+library(gridExtra)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load-data}
+# Set working directory to project root
+setwd("C:/Users/mohi2/OneDrive/Documents/GIT Projects/E-Cigarette_Regulations_Analysis/")
+
+# Load Dataset from the Same Directory as the Code
+file_name <- "CDC_STATE_System_E-Cigarette_Legislation.csv"
+file_path <- paste0(getwd(), "/data/", file_name)
+data <- read.csv(file_path)
+
+# Data Preprocessing
+data <- data %>%
+  mutate(
+    Effective_Date = as.Date(Effective_Date, format = "%m/%d/%Y"),
+    Year_Quarter = paste(YEAR, "Q", Quarter, sep = "")
+  ) %>%
+  filter(!is.na(Effective_Date))
+```
+
+```{r calculate-stringency}
+# Calculate Stringency Score Based on Policy Provisions
+data <- data %>%
+  mutate(stringency_score = case_when(
+    ProvisionGroupDesc == "Enforcement" & ProvisionDesc == "Enforcement (Type)" ~
+      case_when(
+        grepl("police|sheriff|peace officer", tolower(ProvisionValue)) ~ 7,
+        grepl("alcoholic beverage|liquor", tolower(ProvisionValue)) ~ 6,
+        grepl("department|commission", tolower(ProvisionValue)) ~ 5,
+        grepl("local|mayor", tolower(ProvisionValue)) ~ 3,
+        ProvisionValue == "Yes" ~ 2,
+        ProvisionValue == "No Provision" ~ 1,
+        TRUE ~ 1
+      ),
+    ProvisionGroupDesc == "Penalties" & ProvisionDesc == "License Suspension or Revocation" ~
+      case_when(
+        ProvisionValue == "Both" ~ 6,
+        ProvisionValue == "Revocation" ~ 4,
+        ProvisionValue == "Suspension" ~ 3,
+        TRUE ~ 1
+      ),
+    ProvisionGroupDesc == "Restrictions" & ProvisionDesc %in% c("Possession Prohibited", "Purchase Prohibited") & ProvisionValue == "Yes" ~ 8,
+    ProvisionGroupDesc == "Restrictions" & ProvisionDesc == "Use Prohibited" & ProvisionValue == "Yes" ~ 7,
+    ProvisionGroupDesc == "Restrictions" & ProvisionDesc %in% c("Banned from Location", "Restriction on Access") & ProvisionValue == "Yes" ~ 6,
+    ProvisionGroupDesc == "Restrictions" & ProvisionDesc == "Minimum Age (Years)" ~
+      case_when(
+        as.numeric(ProvisionValue) == 21 ~ 5,
+        as.numeric(ProvisionValue) == 20 ~ 4,
+        as.numeric(ProvisionValue) == 19 ~ 3,
+        as.numeric(ProvisionValue) == 18 ~ 2,
+        TRUE ~ 1
+      ),
+    TRUE ~ 1
+  ))
+```
+
+```{r aggregate-data}
+# Aggregate Stringency Scores by State and Quarter
+aggregated_data <- data %>%
+  group_by(LocationDesc, Year_Quarter) %>%
+  summarise(Total_Stringency = sum(stringency_score, na.rm = TRUE), .groups = "drop") %>%
+  arrange(LocationDesc, Year_Quarter)
+```
+
+```{r arima-forecast}
+# ARIMA Forecasting for Each State
+state_results <- list()
+future_stringency <- data.frame(State = character(), Future_Stringency = numeric())
+metrics_table <- data.frame(State = character(), MAPE = numeric(), RMSE = numeric())
+
+for (state in unique(aggregated_data$LocationDesc)) {
+  state_data <- aggregated_data %>% filter(LocationDesc == state)
+  if (nrow(state_data) > 5) {
+    ts_data <- ts(state_data$Total_Stringency, frequency = 4)
+    model <- auto.arima(ts_data)
+    forecasted <- forecast(model, h = 4)
+    state_results[[state]] <- list(model = model, forecast = forecasted)
+    future_stringency <- rbind(
+      future_stringency,
+      data.frame(
+        State = state,
+        Future_Stringency = mean(forecasted$mean)
+      )
+    )
+
+    # Collect Error Metrics
+    mape <- mean(abs(residuals(model) / ts_data) * 100)
+    metrics_table <- rbind(
+      metrics_table,
+      data.frame(
+        State = state,
+        MAPE = mape,
+        RMSE = sqrt(mean(residuals(model)^2))
+      )
+    )
+  }
+}
+
+# Print Metrics Table
+knitr::kable(metrics_table, caption = "ARIMA Model Metrics for Each State")
+```
+
+```{r plot-top-states}
+# Plot Forecast for Top 5 States with Highest Future Stringency
+top_10_states <- future_stringency %>%
+  arrange(desc(Future_Stringency)) %>%
+  head(10)
+
+top_5_states <- head(top_10_states, 5)
+forecast_plots <- list()
+for (state in top_5_states$State) {
+  forecast_result <- state_results[[state]]
+  forecast_plots[[state]] <- autoplot(forecast_result$forecast) +
+    ggtitle(paste("Time Series Forecast for", state)) +
+    xlab("Time") +
+    ylab("Total Stringency Score")
+}
+
+gridExtra::grid.arrange(grobs = forecast_plots, ncol = 2)
+```
+
+```{r plot-top-10}
+# Bar Plot of Top 10 States with Highest Expected Stringency
+ggplot(top_10_states, aes(x = reorder(State, -Future_Stringency), y = Future_Stringency)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  theme_minimal() +
+  labs(
+    title = "Top 10 States with Highest Expected Stringency",
+    x = "State",
+    y = "Expected Stringency Score"
+  ) +
+  coord_flip()
+```
